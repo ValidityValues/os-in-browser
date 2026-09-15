@@ -1,5 +1,6 @@
-name: Remote Desktop
-run-name: ${{ inputs.os }}
+name: macOS Remote Desktop
+
+run-name: macOS ARM Remote Desktop
 
 defaults:
   run:
@@ -8,30 +9,21 @@ defaults:
 on:
   workflow_dispatch:
     inputs:
-      os:
-        description: Operating system
-        type: choice
-        required: true
-        default: windows-latest
-        options:
-          - windows-latest
-          - ubuntu-latest
-          - macos-latest
-
       username:
-        description: Username
+        description: "Username for the remote desktop"
         type: string
         required: true
+        default: "macuser"
 
       password:
-        description: Password
+        description: "Password for the remote desktop"
         type: string
         required: true
 
 jobs:
-  job:
-    name: URL
-    runs-on: ${{ inputs.os }}
+  macos:
+    name: macOS ARM64 Desktop
+    runs-on: macos-26-xlarge
 
     environment:
       name: ${{ github.run_id }}
@@ -45,210 +37,186 @@ jobs:
       GITHUB_TOKEN: ${{ github.token }}
 
     steps:
-      - name: Start tunnel
+      - name: Show runner information
+        run: |
+          echo "=== SYSTEM ==="
+          sw_vers
+
+          echo
+          echo "=== KERNEL ==="
+          uname -a
+
+          echo
+          echo "=== CPU ==="
+          sysctl -n machdep.cpu.brand_string || true
+          sysctl -n hw.ncpu || true
+          sysctl -n hw.memsize || true
+
+          echo
+          echo "=== ARCH ==="
+          uname -m
+
+          echo
+          echo "=== MACOS ==="
+          system_profiler SPHardwareDataType
+
+      - name: Install cloudflared
+        run: |
+          curl -fsSL \
+            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64.tgz" \
+            -o cloudflared.tgz
+
+          tar -xzf cloudflared.tgz
+
+          chmod +x ./cloudflared
+
+          ./cloudflared --version
+
+      - name: Start Cloudflare Tunnel
         id: tunnel
         env:
-          METRICS_URL: "localhost:8081"
+          METRICS_URL: "127.0.0.1:8081"
         run: |
-          case "$RUNNER_OS" in
-            Windows)
-              CLOUDFLARED=./cloudflared.exe
-
-              curl -fsSL \
-                "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" \
-                -o "${CLOUDFLARED}"
-              ;;
-
-            Linux)
-              CLOUDFLARED=./cloudflared
-
-              curl -fsSL \
-                "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64" \
-                -o "${CLOUDFLARED}"
-              ;;
-
-            macOS)
-              CLOUDFLARED=./cloudflared
-
-              curl -fsSL \
-                "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64.tgz" |
-                tar -xz
-              ;;
-          esac
-
-          chmod +x "${CLOUDFLARED}"
-
-          "${CLOUDFLARED}" tunnel \
+          ./cloudflared tunnel \
             --metrics="${METRICS_URL}" \
-            --url "http://localhost:${PORT}" &
+            --url "http://127.0.0.1:${PORT}" \
+            > cloudflared.log 2>&1 &
 
-          until JSON="$(curl -sS "${METRICS_URL}/quicktunnel")"; do
-            sleep 0.1
+          CLOUDFLARED_PID=$!
+          echo "pid=${CLOUDFLARED_PID}" >> "$GITHUB_OUTPUT"
+
+          echo "Waiting for Cloudflare Quick Tunnel..."
+
+          for i in {1..120}; do
+            if JSON="$(curl -fsS "http://${METRICS_URL}/quicktunnel" 2>/dev/null)"; then
+              HOSTNAME="$(jq -r '.hostname // empty' <<< "${JSON}")"
+
+              if [ -n "${HOSTNAME}" ]; then
+                TUNNEL_URL="https://${HOSTNAME}"
+
+                echo "url=${TUNNEL_URL}" >> "$GITHUB_OUTPUT"
+
+                echo
+                echo "========================================"
+                echo "REMOTE DESKTOP URL:"
+                echo "${TUNNEL_URL}"
+                echo "========================================"
+                echo
+
+                break
+              fi
+            fi
+
+            sleep 1
           done
 
-          HOSTNAME="$(jq -r '.hostname' <<< "${JSON}")"
-          TUNNEL_URL="https://${HOSTNAME}"
+          if ! grep -q '^url=' "$GITHUB_OUTPUT"; then
+            echo "Cloudflare Quick Tunnel failed to start."
+            echo
+            cat cloudflared.log || true
+            exit 1
+          fi
 
-          echo "url=${TUNNEL_URL}" >> "$GITHUB_OUTPUT"
-
-      - name: Setup Ubuntu desktop and audio
-        if: runner.os == 'Linux'
-        run: |
-          sudo rm -rf /var/lib/apt/lists/*
-          sudo apt-get clean
-          sudo apt-get update
-
-          sudo apt-get install -y --no-install-recommends \
-            icewm \
-            xvfb \
-            libx11-6 \
-            libxtst6 \
-            libxfixes3 \
-            pulseaudio \
-            pulseaudio-utils
-
-          read -r DISPLAY_NUMBER < <(
-            Xvfb \
-              -displayfd 1 \
-              -screen 0 1920x1080x24 \
-              +extension XTEST \
-              +extension XFIXES \
-              -nolisten tcp
-          )
-
-          export DISPLAY=":$DISPLAY_NUMBER"
-          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
-
-          mkdir -p "$XDG_RUNTIME_DIR"
-          chmod 700 "$XDG_RUNTIME_DIR"
-
-          echo "DISPLAY=$DISPLAY" >> "$GITHUB_ENV"
-          echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" >> "$GITHUB_ENV"
-
-          pulseaudio --start --exit-idle-time=-1
-
-          pactl load-module module-null-sink \
-            sink_name=remote_desktop \
-            sink_properties=device.description=RemoteDesktop
-
-          pactl set-default-sink remote_desktop
-
-          echo "=== PulseAudio ==="
-          pactl info
-
-          echo "=== Sinks ==="
-          pactl list short sinks
-
-          echo "=== Sources ==="
-          pactl list short sources
-
-          icewm-session &
-
-      - name: Setup Windows audio
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          Invoke-WebRequest `
-            https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack45.zip `
-            -OutFile "$env:RUNNER_TEMP\VBCABLE.zip"
-
-          Expand-Archive `
-            "$env:RUNNER_TEMP\VBCABLE.zip" `
-            -DestinationPath "$env:RUNNER_TEMP\VBCABLE"
-
-          & "$env:RUNNER_TEMP\VBCABLE\VBCABLE_Setup_x64.exe" -i -h
-
-          Start-Service audiosrv
-
-          Install-Module AudioDeviceCmdlets -Force -Confirm:$false
-          Import-Module AudioDeviceCmdlets
-
-          $cable = Get-AudioDevice -List |
-            Where-Object { $_.Name -like "CABLE Input*" } |
-            Select-Object -First 1
-
-          if (-not $cable) {
-            Get-AudioDevice -List | Format-Table -AutoSize
-            throw "VB-CABLE playback device not found"
-          }
-
-          Set-AudioDevice -Index $cable.Index
-
-          Get-AudioDevice -Playback
-
-      - name: Resolve latest release tag
-        id: release
-        run: |
-          TAG="$(gh release view \
-            --repo "$GITHUB_REPOSITORY" \
-            --json tagName \
-            --jq .tagName 2>/dev/null \
-          || gh release view \
-            --repo "kingdudely/os-in-browser" \
-            --json tagName \
-            --jq .tagName)"
-
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-
-      - name: Install Electron binary
+      - name: Download macOS ARM64 os-in-browser
         env:
-          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_REPO: kingdudely/os-in-browser
         run: |
-          VERSION="${RELEASE_TAG#v}"
+          echo "Getting latest release..."
 
-          case "$RUNNER_OS" in
-            Linux)
-              ZIP_NAME="os-in-browser-linux-x64-${VERSION}.zip"
-              ;;
+          TAG="$(
+            gh release view \
+              --repo "${GITHUB_REPOSITORY}" \
+              --json tagName \
+              --jq '.tagName' 2>/dev/null \
+            || gh release view \
+              --repo "${RELEASE_REPO}" \
+              --json tagName \
+              --jq '.tagName'
+          )"
 
-            Windows)
-              ZIP_NAME="os-in-browser-win32-x64-${VERSION}.zip"
-              ;;
+          if [ -z "${TAG}" ]; then
+            echo "Unable to determine latest release tag."
+            exit 1
+          fi
 
-            macOS)
-              ZIP_NAME="os-in-browser-darwin-arm64-${VERSION}.zip"
-              ;;
-          esac
+          echo "Release: ${TAG}"
 
-          gh release download "$RELEASE_TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --pattern "$ZIP_NAME" \
-          || gh release download "$RELEASE_TAG" \
-            --repo "kingdudely/os-in-browser" \
-            --pattern "$ZIP_NAME"
+          VERSION="${TAG#v}"
 
-          unzip -q "$ZIP_NAME" || {
-            status=$?
-            if [ "$status" -ne 1 ]; then
-              exit "$status"
+          ZIP_NAME="os-in-browser-darwin-arm64-${VERSION}.zip"
+
+          echo "Downloading ${ZIP_NAME}..."
+
+          gh release download "${TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern "${ZIP_NAME}" \
+          || gh release download "${TAG}" \
+            --repo "${RELEASE_REPO}" \
+            --pattern "${ZIP_NAME}"
+
+          unzip -q "${ZIP_NAME}" || {
+            STATUS=$?
+
+            if [ "${STATUS}" -ne 1 ]; then
+              exit "${STATUS}"
             fi
           }
 
-      - name: Run remote desktop
+          echo
+          echo "Downloaded files:"
+          find . -maxdepth 3 -type f | sort
+
+      - name: Prepare credentials
+        run: |
+          USERNAME="$(jq -r '.inputs.username // empty' "$GITHUB_EVENT_PATH")"
+          PASSWORD="$(jq -r '.inputs.password // empty' "$GITHUB_EVENT_PATH")"
+
+          if [ -z "${USERNAME}" ]; then
+            echo "Username is empty."
+            exit 1
+          fi
+
+          if [ -z "${PASSWORD}" ]; then
+            echo "Password is empty."
+            exit 1
+          fi
+
+          echo "::add-mask::${USERNAME}"
+          echo "::add-mask::${PASSWORD}"
+
+          echo "USERNAME=${USERNAME}" >> "$GITHUB_ENV"
+          echo "PASSWORD=${PASSWORD}" >> "$GITHUB_ENV"
+
+      - name: Launch macOS remote desktop
         env:
           TUNNEL_URL: ${{ steps.tunnel.outputs.url }}
         run: |
-          export USERNAME=$(jq -r '.inputs.username // ""' "$GITHUB_EVENT_PATH")
-          echo "::add-mask::${USERNAME}"
+          echo
+          echo "========================================"
+          echo "macOS ARM64 remote desktop"
+          echo "========================================"
+          echo "Runner:"
+          sw_vers
+          echo
+          echo "Architecture:"
+          uname -m
+          echo
+          echo "Remote URL:"
+          echo "${TUNNEL_URL}"
+          echo "========================================"
+          echo
 
-          export PASSWORD=$(jq -r '.inputs.password // ""' "$GITHUB_EVENT_PATH")
-          echo "::add-mask::${PASSWORD}"
+          APP_BINARY="./os-in-browser.app/Contents/MacOS/os-in-browser"
 
-          case "$RUNNER_OS" in
-            Linux)
-              sudo chown root:root ./os-in-browser-linux-x64/chrome-sandbox
-              sudo chmod 4755 ./os-in-browser-linux-x64/chrome-sandbox
-              ./os-in-browser-linux-x64/os-in-browser --enable-features=PulseaudioLoopbackForScreenShare --disable-features=WebRtcAllowInputVolumeAdjustment
+          if [ ! -f "${APP_BINARY}" ]; then
+            echo "Application binary not found:"
+            echo "${APP_BINARY}"
+            echo
+            find . -name "os-in-browser" -o -name "os-in-browser.app"
+            exit 1
+          fi
 
-              ;;
+          chmod +x "${APP_BINARY}"
 
-            Windows)
-              ./os-in-browser-win32-x64/os-in-browser.exe
-
-              ;;
-
-            macOS)
-              chmod +x ./os-in-browser.app/Contents/MacOS/os-in-browser
-              ./os-in-browser.app/Contents/MacOS/os-in-browser --disable-features=MacCatapLoopbackAudioForScreenShare
-              ;;
-          esac
+          "${APP_BINARY}" \
+            --disable-features=MacCatapLoopbackAudioForScreenShare
